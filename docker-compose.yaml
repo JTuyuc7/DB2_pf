@@ -1,0 +1,80 @@
+services:
+  # ============================================
+  # ORACLE XE 21c - Sede Central (Administrativo)
+  # ============================================
+  oracle:
+    image: gvenzl/oracle-xe:21-slim-faststart
+    container_name: bdd_oracle
+    restart: unless-stopped
+    ports:
+      - "1521:1521"
+    environment:
+      ORACLE_PASSWORD: OraclePass123
+      APP_USER: admin_central
+      APP_USER_PASSWORD: AdminPass123
+    volumes:
+      - oracle_data:/opt/oracle/oradata
+      - ./sql/oracle:/container-entrypoint-initdb.d
+    networks:
+      - bdd-net
+    healthcheck:
+      test: ["CMD", "healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ============================================
+  # PostgreSQL 16 - Sucursal Occidente (Inventario)
+  # ============================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: bdd_postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: admin_inventario
+      POSTGRES_PASSWORD: PostgresPass123
+      POSTGRES_DB: inventario_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/postgres:/docker-entrypoint-initdb.d
+    networks:
+      - bdd-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin_inventario -d inventario_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ============================================
+  # SQL Server 2022 - Sucursal Capital (Ventas)
+  # ============================================
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: bdd_sqlserver
+    restart: unless-stopped
+    ports:
+      - "1433:1433"
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "SqlServerPass123!"
+      MSSQL_PID: "Developer"
+    volumes:
+      - sqlserver_data:/var/opt/mssql
+    networks:
+      - bdd-net
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'SqlServerPass123!' -C -Q 'SELECT 1' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  oracle_data:
+  postgres_data:
+  sqlserver_data:
+
+networks:
+  bdd-net:
+    driver: bridge
