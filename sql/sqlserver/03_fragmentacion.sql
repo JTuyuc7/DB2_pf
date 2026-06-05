@@ -1,49 +1,46 @@
 -- ============================================================
--- SQL Server — Fragmentación Horizontal en tabla ventas
--- TecnoChapina S.A. — Día 4
--- Ejecutar como sa, en contexto de ventas_db
+-- SQL Server 2022 — Fragmentación horizontal de ventas
+-- TecnoChapina S.A.
 -- ============================================================
+-- ARQUITECTURA ACTUALIZADA:
+--   Fragmento Capital   (sucursal_id=1) → SQL Server  ← este archivo
+--   Fragmento Occidente (sucursal_id=2) → PostgreSQL  ← sql/postgres/03_ventas.sql
+--
+-- El backend (FastAPI) orquesta el routing: inserts y queries
+-- se dirigen al motor correcto según sucursal_id.
+-- En modo failover, SQL Server se reemplaza por Oracle (backup).
+-- ============================================================
+
 USE ventas_db;
 GO
 
--- ──────────────────────────────────────────────
--- Vistas que simulan los "fragmentos" físicos
--- En un sistema real cada vista viviría en un
--- servidor diferente. Aquí lo simulamos con
--- filtros sobre sucursal_id.
--- ──────────────────────────────────────────────
+-- ──────────────────────────────────────────────────────────
+-- Vista: fragmento Capital (sucursal_id = 1)
+-- Útil para verificar el fragmento en DBeaver
+-- ──────────────────────────────────────────────────────────
 
--- Fragmento 1: Sucursal Capital (Zona 10, Guatemala)
 CREATE OR ALTER VIEW dbo.ventas_capital AS
 SELECT * FROM dbo.ventas WHERE sucursal_id = 1;
 GO
 
--- Fragmento 2: Sucursal Occidente (Quetzaltenango)
-CREATE OR ALTER VIEW dbo.ventas_occidente AS
-SELECT * FROM dbo.ventas WHERE sucursal_id = 2;
+-- Occidente ya no vive en SQL Server — eliminar vista si existía
+IF OBJECT_ID('dbo.ventas_occidente', 'V') IS NOT NULL
+    DROP VIEW dbo.ventas_occidente;
 GO
 
--- ──────────────────────────────────────────────
--- Verificación: resumen por fragmento
--- ──────────────────────────────────────────────
+-- ──────────────────────────────────────────────────────────
+-- Verificación: resumen del fragmento Capital
+-- ──────────────────────────────────────────────────────────
 SELECT
-    'Capital'         AS sucursal,
-    COUNT(*)          AS total_ventas,
-    SUM(total)        AS ingresos_total,
-    MIN(fecha_venta)  AS primera_venta,
-    MAX(fecha_venta)  AS ultima_venta
-FROM dbo.ventas WHERE sucursal_id = 1
-UNION ALL
-SELECT
-    'Occidente'       AS sucursal,
-    COUNT(*)          AS total_ventas,
-    SUM(total)        AS ingresos_total,
-    MIN(fecha_venta)  AS primera_venta,
-    MAX(fecha_venta)  AS ultima_venta
-FROM dbo.ventas WHERE sucursal_id = 2;
+    'Capital (SQL Server)'        AS fragmento,
+    COUNT(*)                      AS total_ventas,
+    SUM(total)                    AS ingresos_total,
+    MIN(fecha_venta)              AS primera_venta,
+    MAX(fecha_venta)              AS ultima_venta
+FROM dbo.ventas
+WHERE sucursal_id = 1;
 GO
 
--- Consultar cada fragmento por separado (como si fueran tablas distintas)
-SELECT 'CAPITAL'   AS fragmento, id_venta, id_cliente, total, fecha_venta FROM dbo.ventas_capital;
-SELECT 'OCCIDENTE' AS fragmento, id_venta, id_cliente, total, fecha_venta FROM dbo.ventas_occidente;
+-- Nota: el fragmento Occidente (sucursal_id=2) se verifica en PostgreSQL:
+--   SELECT COUNT(*), SUM(total) FROM inventario.ventas WHERE sucursal_id = 2;
 GO
