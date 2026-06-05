@@ -7,7 +7,7 @@
 **Curso:** Base de Datos II
 **Catedrático:** Ing. Angel Atilio Maltez C.
 **Universidad:** Universidad Mariano Gálvez de Guatemala
-**Fecha de entrega:** 2 de junio de 2026
+**Fecha de entrega:** 5 de junio de 2026
 **Estudiante:** _Jaime Israel Tuyuc Tzaj_
 **Carné:** _1990-18-2320_
 
@@ -51,51 +51,76 @@ adoptan tecnologías distintas según sus necesidades históricas.
 
 ## 2. Arquitectura distribuida
 
-TecnoChapina implementa un modelo **Hub-and-Spoke** donde Oracle (Sede Central)
-actúa como nodo central administrativo, y PostgreSQL y SQL Server operan como
-nodos periféricos especializados. La integración de datos entre los tres motores
-se realiza a través de una capa de aplicación en Python (FastAPI) que orquesta
-las consultas distribuidas y la replicación entre nodos.
+TecnoChapina implementa un modelo **Hub-and-Spoke con fragmentación física real** donde:
 
-![Diagrama de arquitectura](docs/diagrama-arquitectura.png)
+- **Oracle XE 21c** es el nodo central administrativo (empleados, proveedores, auditoría) y actúa además como **nodo de backup/failover** para SQL Server.
+- **PostgreSQL 16** gestiona el inventario y almacena físicamente las ventas de Sucursal Occidente (`sucursal_id = 2`).
+- **SQL Server 2022** almacena físicamente las ventas de Sucursal Capital (`sucursal_id = 1`) junto con los clientes.
+
+La integración entre los tres motores se realiza a través de una capa de aplicación en Python (FastAPI) que orquesta las consultas distribuidas, el routing de inserciones y la conmutación por error (failover).
+
+### Fragmentación horizontal física
+
+La tabla `ventas` está **fragmentada físicamente** entre dos motores distintos:
+
+| Fragmento | Motor | Condición | Tablas |
+|-----------|-------|-----------|--------|
+| Capital | SQL Server (`ventas_db`) | `sucursal_id = 1` | `dbo.ventas`, `dbo.detalle_ventas` |
+| Occidente | PostgreSQL (`inventario_db`) | `sucursal_id = 2` | `inventario.ventas`, `inventario.detalle_ventas` |
+
+El backend decide en qué motor insertar o consultar en función del `sucursal_id` de cada operación. Ningún motor conoce la existencia del otro.
+
+### Failover transparente (Oracle como backup de SQL Server)
+
+Cuando se activa el modo failover (simulación de caída de SQL Server):
+
+1. Las consultas de Capital se redirigen a las tablas de backup en Oracle (`ventas_backup`, `detalle_ventas_backup`).
+2. Las nuevas ventas de Capital también se insertan en Oracle.
+3. La UI muestra el motor activo pero el flujo de negocio continúa sin interrupción.
+
+Ver diagramas completos en [`docs/arquitectura_v2.md`](docs/arquitectura_v2.md).
+
+![Diagrama de arquitectura](docs/capturas/arquitectura_v2.png)
 
 ### Componentes del sistema
 
-- **Capa de datos:** tres motores corriendo en contenedores Docker aislados pero
-  conectados por una red interna compartida (`bdd-net`).
-- **Capa de integración:** servicio backend en **FastAPI (Python)** que se conecta
-  a los tres motores y expone endpoints REST para la UI.
-- **Capa de presentación:** aplicación web en **Next.js 15** con interfaz mínima
-  para ejecutar las consultas distribuidas y visualizar los resultados con
-  indicadores del motor de origen.
+- **Capa de datos:** tres motores corriendo en contenedores Docker aislados pero conectados por una red interna compartida (`bdd-net`).
+- **Capa de integración:** servicio backend en **FastAPI (Python)** que se conecta a los tres motores y expone endpoints REST para la UI. Contiene la lógica de routing por sucursal y el estado del failover.
+- **Capa de presentación:** aplicación web en **Next.js 15** con tres tabs: consultas distribuidas, inserción de ventas y panel de sistema/failover.
 
 ---
 
 ## 3. Distribución de datos por motor
 
-### Oracle (Sede Central — Administrativo)
+### Oracle (Sede Central — Administrativo + Backup)
 
-| Tabla | Descripción |
-|-------|-------------|
-| `empleados` | Personal de las tres sedes |
-| `proveedores` | Proveedores de productos electrónicos |
-| `auditoria` | Registro centralizado de operaciones críticas |
+| Tabla | Esquema | Descripción |
+|-------|---------|-------------|
+| `empleados` | `admin_central` | Personal de las tres sedes |
+| `proveedores` | `admin_central` | Proveedores de productos electrónicos |
+| `auditoria` | `admin_central` | Registro centralizado de operaciones críticas |
+| `ventas_backup` | `admin_central` | Backup de ventas Capital (failover) |
+| `detalle_ventas_backup` | `admin_central` | Backup de detalle_ventas Capital (failover) |
 
-### PostgreSQL (Sucursal Occidente — Inventario)
+> Las tablas `ventas_backup` y `detalle_ventas_backup` se llenan bajo demanda con el endpoint `POST /backup-oracle`. En estado normal (sin failover) están vacías o contienen el último snapshot.
 
-| Tabla | Descripción |
-|-------|-------------|
-| `categorias` | Categorías de productos (celulares, laptops, accesorios) |
-| `productos` | Catálogo completo de productos |
-| `inventario` | Stock disponible por producto y bodega |
+### PostgreSQL (Sucursal Occidente — Inventario + Ventas Occidente)
 
-### SQL Server (Sucursal Capital — Ventas)
+| Tabla | Esquema | Descripción |
+|-------|---------|-------------|
+| `categorias` | `inventario` | Categorías de productos |
+| `productos` | `inventario` | Catálogo completo de productos |
+| `inventario` | `inventario` | Stock disponible por producto y bodega |
+| `ventas` | `inventario` | **Fragmento Occidente** — ventas `sucursal_id = 2` |
+| `detalle_ventas` | `inventario` | Líneas de detalle de ventas Occidente |
 
-| Tabla | Descripción |
-|-------|-------------|
-| `clientes` | Clientes registrados de TecnoChapina |
-| `ventas` | Cabecera de cada venta realizada |
-| `detalle_ventas` | Líneas de detalle por venta |
+### SQL Server (Sucursal Capital — Clientes + Ventas Capital)
+
+| Tabla | Esquema | Descripción |
+|-------|---------|-------------|
+| `clientes` | `dbo` | Clientes registrados de TecnoChapina (todas las sedes) |
+| `ventas` | `dbo` | **Fragmento Capital** — ventas `sucursal_id = 1` |
+| `detalle_ventas` | `dbo` | Líneas de detalle de ventas Capital |
 
 ---
 
@@ -301,19 +326,23 @@ Las tres tablas (`clientes`, `ventas`, `detalle_ventas`) se crearon en `ventas_d
 
 ### 7.4 Datos seed
 
-Se insertaron datos realistas de una empresa guatemalteca de electrónica:
+Se insertaron datos realistas de una empresa guatemalteca de electrónica. La distribución final para la demo tiene 5 ventas por fragmento para facilitar la verificación visual:
 
-| Motor | Tabla | Registros |
-|---|---|---|
-| Oracle | `empleados` | 10 (3 Central, 4 Occidente, 3 Capital) |
-| Oracle | `proveedores` | 5 |
-| Oracle | `auditoria` | 10 |
-| PostgreSQL | `categorias` | 5 |
-| PostgreSQL | `productos` | 15 |
-| PostgreSQL | `inventario` | 15 |
-| SQL Server | `clientes` | 15 |
-| SQL Server | `ventas` | 20 (10 por sucursal) |
-| SQL Server | `detalle_ventas` | 35 |
+| Motor | Tabla | Registros (demo) | Notas |
+|---|---|---|---|
+| Oracle | `empleados` | 10 | 3 Central, 4 Occidente, 3 Capital |
+| Oracle | `proveedores` | 5 | — |
+| Oracle | `auditoria` | 10 | — |
+| Oracle | `ventas_backup` | 0 | Vacío en estado inicial; se llena con `POST /backup-oracle` |
+| Oracle | `detalle_ventas_backup` | 0 | Ídem |
+| PostgreSQL | `categorias` | 5 | — |
+| PostgreSQL | `productos` | 15 | — |
+| PostgreSQL | `inventario` | 15 | — |
+| PostgreSQL | `ventas` | 5 | Fragmento Occidente (`sucursal_id = 2`) |
+| PostgreSQL | `detalle_ventas` | 5–7 | Asociadas a ventas Occidente |
+| SQL Server | `clientes` | 15 | Clientes de todas las sedes |
+| SQL Server | `ventas` | 5 | Fragmento Capital (`sucursal_id = 1`) |
+| SQL Server | `detalle_ventas` | 5–7 | Asociadas a ventas Capital |
 
 ![Captura — Seed data Oracle](docs/capturas/oracle_seed_data.png)
 
@@ -327,81 +356,80 @@ Se insertaron datos realistas de una empresa guatemalteca de electrónica:
 
 ## 8. Día 4 — Fragmentación y replicación
 
-### 8.1 Fragmentación horizontal
+### 8.1 Fragmentación horizontal física
 
-La tabla `ventas` en SQL Server ya contiene el campo `sucursal_id` que diferencia las ventas de cada sede. Sobre ese campo se crean dos vistas que simulan los fragmentos físicos que en un sistema real vivirían en servidores distintos.
+La tabla `ventas` está **fragmentada físicamente** entre dos motores distintos. Cada motor contiene únicamente las filas que le corresponden y tiene una restricción (`CHECK`) que previene inserciones incorrectas.
 
-**Script:** `sql/sqlserver/03_fragmentacion.sql` (ejecutar como `sa` en `ventas_db`)
+| Fragmento | Motor | Constraint |
+|-----------|-------|-----------|
+| Capital | SQL Server — `dbo.ventas` | implícito (routing del backend) |
+| Occidente | PostgreSQL — `inventario.ventas` | `CHECK (sucursal_id = 2)` |
 
-```sql
--- Fragmento Capital (sucursal_id = 1)
-CREATE OR ALTER VIEW dbo.ventas_capital   AS SELECT * FROM dbo.ventas WHERE sucursal_id = 1;
+**Scripts de fragmentación:**
 
--- Fragmento Occidente (sucursal_id = 2)
-CREATE OR ALTER VIEW dbo.ventas_occidente AS SELECT * FROM dbo.ventas WHERE sucursal_id = 2;
-```
-
-**Verificación del reparto:**
+- `sql/sqlserver/03_fragmentacion.sql` — crea la vista `ventas_capital` y elimina la vista `ventas_occidente` (ya no vive en SS)
+- `sql/postgres/03_ventas.sql` — crea `inventario.ventas` e `inventario.detalle_ventas` con la restricción de Occidente
 
 ```sql
-SELECT 'Capital'   AS sucursal, COUNT(*) AS total_ventas, SUM(total) AS ingresos
-FROM dbo.ventas WHERE sucursal_id = 1
-UNION ALL
-SELECT 'Occidente', COUNT(*), SUM(total)
-FROM dbo.ventas WHERE sucursal_id = 2;
+-- PostgreSQL: restricción física del fragmento
+CREATE TABLE inventario.ventas (
+    ...
+    sucursal_id INTEGER NOT NULL CHECK (sucursal_id = 2),
+    ...
+);
 ```
 
-Resultado esperado: 10 ventas por fragmento, montos distintos.
+**Routing en el backend:** el campo `sucursal_id` del body del `POST /ventas` determina el motor destino. No hay configuración adicional; el backend conoce la regla de routing.
 
-![Captura — Fragmentación: vistas creadas y consulta de verificación](docs/capturas/fragmentacion_sql.png)
+**Verificación de los tres fragmentos en DBeaver:**
 
-### 8.2 Por qué fragmentación horizontal y no vertical
+```sql
+-- SQL Server
+SELECT COUNT(*) FROM dbo.ventas WHERE sucursal_id = 1;          -- debe dar 5
+SELECT COUNT(*) FROM dbo.ventas WHERE sucursal_id = 2;          -- debe dar 0
 
-La fragmentación **horizontal** divide la tabla por filas (cada fila va a un fragmento). La fragmentación **vertical** dividiría las columnas (parte de los atributos en un nodo, el resto en otro). Se eligió horizontal porque:
+-- PostgreSQL
+SELECT COUNT(*) FROM inventario.ventas WHERE sucursal_id = 2;   -- debe dar 5
+SELECT COUNT(*) FROM inventario.ventas WHERE sucursal_id = 1;   -- debe dar 0
 
-- El criterio natural de distribución es geográfico (por sucursal).
-- Las consultas más frecuentes son por sucursal ("ventas del mes en Capital").
-- No hay columnas de uso exclusivo por una sede que justifiquen partir el esquema.
+-- Oracle (backup — estado inicial vacío)
+SELECT COUNT(*) FROM admin_central.ventas_backup;               -- debe dar 0
+```
 
-### 8.3 Replicación snapshot (PostgreSQL → SQL Server)
+Scripts de verificación: `sql/sqlserver/04_verificar.sql`, `sql/postgres/05_verificar.sql`, `sql/oracle/05_verificar.sql`.
 
-El script `backend/replicacion.py` copia la tabla `inventario.productos` de PostgreSQL hacia una tabla `productos_replica` en SQL Server. Esto permite que el motor de ventas tenga el catálogo disponible localmente para las consultas distribuidas, sin tener que cruzar la red en cada query.
+![Captura — Verificación de fragmentos en DBeaver](docs/capturas/fragmentacion_fisica.png)
 
-**Tipo de replicación:** snapshot — trunca y reinserta en cada ejecución.
+### 8.2 Por qué fragmentación horizontal física y no vistas lógicas
 
-**Por qué snapshot y no incremental:** para el tamaño del catálogo (~15 productos) la diferencia de rendimiento es irrelevante. El snapshot es más simple de implementar y de explicar, y cumple el mismo objetivo pedagógico.
+La fragmentación **física** (tablas en motores distintos) va más allá de las vistas `WHERE sucursal_id = X` sobre una tabla unificada:
 
-#### Instalación de dependencias
+- **Aislamiento real:** si SQL Server cae, PostgreSQL sigue operando con sus datos de Occidente sin ninguna dependencia.
+- **Escalabilidad independiente:** cada motor puede dimensionarse según el volumen de su fragmento.
+- **Demostración del failover:** con una tabla unificada no habría nada que rescatar; con fragmentación física, Oracle puede recibir el fragmento Capital mientras SQL Server "está caído".
+
+### 8.3 Backup snapshot hacia Oracle (failover)
+
+El endpoint `POST /backup-oracle` realiza una copia snapshot del fragmento Capital (SQL Server) hacia las tablas de backup en Oracle. La operación es **idempotente**: borra el contenido anterior antes de insertar.
+
+```
+POST /backup-oracle
+  1. DELETE FROM admin_central.detalle_ventas_backup
+  2. DELETE FROM admin_central.ventas_backup
+  3. SELECT * FROM dbo.ventas        → INSERT INTO ventas_backup (usando ventas_backup_seq)
+  4. SELECT * FROM dbo.detalle_ventas → INSERT INTO detalle_ventas_backup
+  5. COMMIT
+```
+
+Para resetear el estado de Oracle a vacío (antes de una demo): ejecutar `sql/oracle/06_limpiar_backup.sql` en DBeaver.
+
+**Dependencias del backend:**
 
 ```powershell
 cd backend
 pip install -r requirements.txt
 copy .env.example .env
 ```
-
-#### Ejecutar la replicación
-
-```powershell
-python replicacion.py
-```
-
-Salida esperada:
-```
-[2026-05-18 20:00:00] Iniciando replicación productos...
-  [PG]  15 productos leídos desde PostgreSQL (inventario.productos)
-  [SS]  15 productos escritos en SQL Server (productos_replica)
-[2026-05-18 20:00:01] Replicación completada en 0.42s.
-```
-
-#### Verificar en SQL Server
-
-```sql
-USE ventas_db;
-SELECT id_producto, nombre, precio_unitario, replicado_en FROM productos_replica;
--- Debe mostrar los 15 productos de PostgreSQL con timestamp de replicación
-```
-
-![Captura — Replicación ejecutada y productos_replica en SQL Server](docs/capturas/replicacion_productos.png)
 
 ---
 
@@ -420,15 +448,29 @@ Documentación interactiva disponible en: `http://localhost:8000/docs`
 
 ### 9.2 Todos los endpoints
 
-| Endpoint | Método | Descripción | Motores |
+#### Consultas distribuidas
+
+| Endpoint | Descripción | Motores activos | Failover-aware |
 |---|---|---|---|
-| `GET /q1` | GET | Ventas por sucursal con nombre de producto | SQL Server + PostgreSQL |
-| `GET /q2` | GET | Inventario actual vs unidades vendidas | PostgreSQL + SQL Server |
-| `GET /q3` | GET | Top productos más vendidos | SQL Server + PostgreSQL |
-| `GET /q4` | GET | Desempeño de empleados en ventas | SQL Server + Oracle |
-| `GET /q5` | GET | Reporte integrado — últimas 10 ventas | SQL Server + PostgreSQL + Oracle |
-| `GET /catalogos` | GET | Datos de referencia para formularios | SQL Server + Oracle + PostgreSQL |
-| `POST /ventas` | POST | Insertar nueva venta (demuestra fragmentación dinámica) | PostgreSQL + SQL Server |
+| `GET /q1` | Ventas por sucursal con nombre de producto | SS/Oracle* + PG | Sí |
+| `GET /q2` | Inventario actual vs unidades vendidas | PG (inventario + ventas Occ) + SS/Oracle* (Capital) | Sí |
+| `GET /q3` | Top productos más vendidos | SS/Oracle* + PG | Sí |
+| `GET /q4` | Desempeño de empleados en ventas | SS/Oracle* + Oracle (empleados) | Sí |
+| `GET /q5` | Reporte integrado — últimas 10 ventas | SS/Oracle* + PG + Oracle (empleados) | Sí |
+| `GET /q6` | Vista unificada de TODAS las ventas con columna `motor` | SS/Oracle* + PG | Sí |
+
+> \* En modo failover, SQL Server se reemplaza por Oracle backup (`ventas_backup`, `detalle_ventas_backup`).
+
+#### Soporte operacional
+
+| Endpoint | Método | Descripción |
+|---|---|---|
+| `GET /catalogos` | GET | Datos de referencia (clientes, empleados, productos, sucursales) |
+| `POST /ventas` | POST | Insertar nueva venta — routing automático por `sucursal_id` |
+| `GET /estado-sistema` | GET | Estado actual del failover y motores activos |
+| `POST /backup-oracle` | POST | Copia snapshot de Capital (SS) → Oracle backup |
+| `POST /simular-fallo` | POST | Activa failover: Capital redirige a Oracle |
+| `POST /restaurar` | POST | Desactiva failover: vuelve a SQL Server |
 
 ### 9.3 Cómo funcionan las consultas distribuidas
 
@@ -446,58 +488,61 @@ No hay JOINs cross-motor. Los datos viajan por la red una vez por consulta y se 
 
 **Q1 — Ventas por sucursal con nombre de producto**
 
-SQL Server calcula las unidades vendidas e ingresos agrupados por producto y sucursal. PostgreSQL aporta el nombre del producto. El join se hace por `id_producto`.
+Combina ventas de Capital (SS o Oracle backup) y Occidente (PG). PostgreSQL aporta el nombre del producto. El join se hace por `id_producto` en Python.
 
 **Q2 — Inventario actual vs unidades vendidas**
 
-PostgreSQL trae el stock disponible por producto. SQL Server suma las cantidades vendidas. El resultado muestra la diferencia (stock - vendido) para detectar qué productos están en riesgo de quedarse sin existencias.
+PostgreSQL trae el stock disponible por producto y las unidades vendidas en Occidente. SS (o Oracle backup) aporta las unidades vendidas en Capital. El resultado muestra la diferencia para detectar productos en riesgo.
 
 **Q3 — Top productos más vendidos**
 
-SQL Server ordena los productos por unidades vendidas. PostgreSQL agrega el nombre y la categoría. Útil para decisiones de reabastecimiento.
+Suma unidades vendidas en ambos fragmentos (Capital + Occidente). PostgreSQL agrega el nombre y la categoría. Útil para decisiones de reabastecimiento.
 
 **Q4 — Desempeño de empleados en ventas**
 
-SQL Server agrupa las ventas por `id_empleado`. Oracle aporta el nombre, puesto y sede de cada empleado. Muestra cuánto generó cada vendedor.
+Agrupa ventas de ambos fragmentos por `id_empleado`. Oracle aporta el nombre, puesto y sede de cada empleado. Muestra cuánto generó cada vendedor independientemente del motor donde esté el dato.
 
 **Q5 — Reporte integrado (los 3 motores)**
 
-Las 10 ventas más recientes con nombre de cliente (SQL Server), nombre de producto (PostgreSQL) y nombre del empleado que atendió (Oracle). Es la consulta más compleja y la que mejor demuestra la integración de los tres motores.
+Las 10 ventas más recientes de ambos fragmentos, con nombre de cliente (SS), nombre de producto (PG) y nombre del empleado (Oracle). Es la consulta que mejor demuestra la integración de los tres motores.
 
-### 9.5 Endpoints de soporte: catálogos e inserción de ventas
+**Q6 — Vista unificada de todas las ventas**
 
-Además de las 5 consultas de lectura, el backend expone dos endpoints de soporte que alimentan la funcionalidad de inserción de ventas desde la UI.
+Devuelve **todas** las ventas de Capital y Occidente en un solo resultado, con una columna `motor` que indica el origen de cada fila (`SQL Server` / `PostgreSQL` / `Oracle (failover)`). Permite ver el sistema completo de un vistazo y verificar que no hay solapamientos entre fragmentos.
+
+### 9.5 Endpoints de soporte: catálogos, inserción y failover
 
 **`GET /catalogos`**
 
-Consulta los tres motores en paralelo y devuelve todos los datos de referencia necesarios para el formulario de nueva venta.
-
-```json
-{
-  "clientes":   [{ "id": 1, "nombre": "Juan Pérez" }],
-  "empleados":  [{ "id": 1, "nombre": "Ana López", "puesto": "Vendedora" }],
-  "productos":  [{ "id": 1, "nombre": "Galaxy S24", "precio": 2399.99 }],
-  "sucursales": [{ "id": 1, "nombre": "Capital" }, { "id": 2, "nombre": "Occidente" }]
-}
-```
-
-Si uno de los motores no responde, devuelve lista vacía para ese campo y los demás se cargan igualmente.
+Consulta los tres motores y devuelve los datos de referencia para el formulario de nueva venta.
 
 **`POST /ventas`**
 
-Registra una nueva venta en SQL Server en dos pasos:
-1. Consulta el `precio_unitario` del producto en **PostgreSQL** (fuente de verdad del catálogo).
-2. Inserta en `ventas` y `detalle_ventas` en **SQL Server**.
+Routing automático por `sucursal_id`:
 
 ```json
-// Body de la petición
+// Body
 { "id_cliente": 3, "id_empleado": 2, "id_producto": 5, "cantidad": 2, "sucursal_id": 1 }
 
 // Respuesta
-{ "ok": true, "id_venta": 42, "sucursal": "Capital", "fragmento": "ventas_capital", "total": 4799.98 }
+{ "ok": true, "id_venta": 42, "sucursal": "Capital", "motor": "SQL Server", "total": 9599.96 }
 ```
 
-El campo `fragmento` en la respuesta muestra explícitamente en qué fragmento lógico quedó el registro. Como la fragmentación está implementada con vistas SQL (`WHERE sucursal_id = 1`), el nuevo registro aparece automáticamente en `ventas_capital` o `ventas_occidente` sin ningún paso adicional.
+- `sucursal_id = 2` → siempre PostgreSQL
+- `sucursal_id = 1` + failover desactivado → SQL Server
+- `sucursal_id = 1` + failover activo → Oracle (`ventas_backup`, usa `ventas_backup_seq.NEXTVAL`)
+
+**`GET /estado-sistema`**
+
+```json
+{ "failover_activo": false, "capital": "SQL Server", "occidente": "PostgreSQL", "oracle_backup": "standby" }
+```
+
+**`POST /backup-oracle`** — copia snapshot Capital → Oracle (idempotente).
+
+**`POST /simular-fallo`** — activa failover. Capital empieza a leer y escribir en Oracle.
+
+**`POST /restaurar`** — desactiva failover. Capital vuelve a SQL Server.
 
 ![Captura — Backend FastAPI corriendo](docs/capturas/backend_api.png)
 
@@ -520,7 +565,9 @@ El campo `fragmento` en la respuesta muestra explícitamente en qué fragmento l
 
 ## 10. Día 6 — Interfaz de usuario
 
-La interfaz se construyó con **Next.js 16** (App Router) y **Tailwind CSS 4**. Tiene dos secciones accesibles desde un tab bar: consultas distribuidas e inserción de nuevas ventas.
+La interfaz se construyó con **Next.js 15** (App Router) y **Tailwind CSS 4**. Tiene **tres tabs** accesibles desde un tab bar: consultas distribuidas, inserción de ventas y panel de sistema/failover.
+
+Cuando el failover está activo, un **banner naranja** aparece en la parte superior de todas las tabs indicando que Capital está operando sobre Oracle backup.
 
 ### 10.1 Levantar el frontend
 
@@ -537,17 +584,16 @@ Abrir: `http://localhost:3000`
 
 | Elemento | Descripción |
 |---|---|
-| Dropdown | Selecciona la consulta a ejecutar (Q1–Q5) |
+| Dropdown | Selecciona la consulta a ejecutar (Q1–Q6) |
 | Badges de motores | Muestra qué motores participan en cada consulta (color por motor) |
+| Badge FAILOVER | Aparece en naranja cuando una consulta está leyendo desde Oracle backup |
 | Botón Ejecutar | Llama al endpoint FastAPI y muestra los resultados |
 | Tabla dinámica | Genera columnas automáticamente a partir de las claves del JSON |
-| Indicador de estado | Muestra "Cargando…" durante la petición y el total de filas al terminar |
+| Columna `motor` (Q6) | Indica el motor origen de cada fila de la vista unificada |
 
 ### 10.3 Tab — Nueva venta (fragmentación dinámica)
 
-Permite insertar una nueva venta desde la UI y **demuestra que la fragmentación horizontal opera en tiempo real**: cualquier registro nuevo queda automáticamente en el fragmento correcto según la sucursal elegida.
-
-**Campos del formulario:**
+Permite insertar una nueva venta y **demuestra el routing real entre motores**:
 
 | Campo | Fuente de datos | Motor |
 |---|---|---|
@@ -557,7 +603,7 @@ Permite insertar una nueva venta desde la UI y **demuestra que la fragmentación
 | Producto | `GET /catalogos` | PostgreSQL |
 | Cantidad | Número libre (mínimo 1) | — |
 
-El precio se obtiene de PostgreSQL en el momento del registro. El `total` se calcula como `precio_unitario × cantidad`.
+La UI muestra el motor activo al que irá la venta (según el estado de failover). Con failover activo, Capital aparece como "Oracle (backup)".
 
 **Flujo completo:**
 
@@ -566,32 +612,54 @@ El precio se obtiene de PostgreSQL en el momento del registro. El `total` se cal
 2. Los dropdowns se cargan automáticamente desde /catalogos
 3. Seleccionar sucursal, cliente, empleado, producto y cantidad
 4. Click "Registrar venta"
-5. La UI muestra:
-      ✓ Venta #42 registrada en Capital
-      Fragmento: [ventas_capital]
-      Total: Q 4,799.98
-      [Ver en Q1 →]
-6. Click "Ver en Q1 →" → ejecuta Q1 automáticamente y el nuevo
-   registro aparece en la tabla bajo la sucursal correcta
+5. La UI muestra motor destino, id_venta generado y total
+6. Click "Ver en Q6 →" para verificar el registro en la vista unificada
 ```
 
-La fragmentación funciona porque `ventas_capital` y `ventas_occidente` son vistas SQL (`WHERE sucursal_id = 1/2`). No requieren mantenimiento: el INSERT es suficiente para que el registro aparezca en el fragmento correspondiente.
+### 10.4 Tab — Sistema / Failover
 
-### 10.4 Estructura del frontend
+Panel de control para demostrar la tolerancia a fallos en tiempo real:
+
+| Elemento | Descripción |
+|---|---|
+| Tabla de motores | Estado actual de cada motor (activo / backup / standby) |
+| Botón "Crear backup en Oracle" | Ejecuta `POST /backup-oracle` — copia snapshot de Capital |
+| Botón "Simular fallo SS" | Activa failover — todas las consultas y escrituras de Capital van a Oracle |
+| Botón "Restaurar SS" | Desactiva failover — vuelve a SQL Server |
+| Atajos de demo rápida | Botones Q1, Q4, Q5, Q6 para verificar el estado del sistema al instante |
+
+**Flujo de demo en la defensa:**
+
+```
+1. Abrir tab Sistema → mostrar estado normal (SS activo)
+2. Ejecutar "Crear backup en Oracle" → Oracle pasa de 0 a N registros
+3. Ejecutar "Simular fallo SS" → banner naranja aparece en todas las tabs
+4. Insertar nueva venta Capital → va a Oracle (el ID empieza en 10001+)
+5. Ejecutar Q6 → columna motor muestra "Oracle (failover)" para Capital
+6. Ejecutar "Restaurar SS" → sistema vuelve a normal, banner desaparece
+```
+
+### 10.5 Estructura del frontend
 
 ```
 frontend/
 ├── app/
 │   ├── layout.tsx        # Título "TecnoChapina S.A. — BD2"
-│   ├── page.tsx          # Toda la lógica: tabs, consultas y formulario
+│   ├── page.tsx          # Toda la lógica: 3 tabs, consultas, formulario, failover
 │   └── globals.css       # Tailwind 4 con @import "tailwindcss"
 ├── .env.local            # NEXT_PUBLIC_API_URL=http://localhost:8000
-└── package.json          # Next.js 16, React 19, Tailwind 4 (pnpm)
+└── package.json          # Next.js 15, React 19, Tailwind 4 (pnpm)
 ```
 
-### 10.5 Captura de la interfaz
+### 10.6 Capturas de la interfaz
 
-![Captura — Integración UI](docs/capturas/integracion_ui.png)
+![Captura — Tab Consultas distribuidas](docs/capturas/ui_consultas.png)
+
+![Captura — Tab Nueva venta](docs/capturas/ui_nueva_venta.png)
+
+![Captura — Tab Sistema / Failover](docs/capturas/ui_sistema_failover.png)
+
+![Captura — Banner failover activo](docs/capturas/ui_failover_banner.png)
 
 ---
 
@@ -599,36 +667,36 @@ frontend/
 
 ### 11.1 Ventajas observadas
 
+**Fragmentación física real:**
+Los datos de Capital y Occidente viven en motores distintos. Si SQL Server cae, PostgreSQL sigue operando con todos sus datos de Occidente sin ninguna dependencia. El failover a Oracle demuestra que la arquitectura puede sobrevivir la pérdida de un nodo.
+
 **Especialización por motor:**
-Cada motor hace lo que mejor sabe hacer. Oracle maneja datos administrativos con su sistema de usuarios, roles y tablespaces. PostgreSQL gestiona el inventario con sus tipos de datos avanzados. SQL Server procesa las transacciones de ventas. No se usa un solo motor "para todo" y eso refleja decisiones reales de arquitectura empresarial.
+Oracle maneja administración con tablespaces y auditoría. PostgreSQL gestiona inventario y el fragmento Occidente. SQL Server procesa el fragmento Capital. Cada motor hace lo que mejor sabe hacer.
 
-**Aislamiento de fallos:**
-Si PostgreSQL (inventario) tiene un problema, las ventas en SQL Server siguen funcionando. Los sistemas no comparten el mismo proceso ni el mismo almacenamiento.
+**Failover transparente para la UI:**
+El cambio de motor ocurre completamente en el backend. La interfaz de usuario no sabe qué motor está respondiendo; solo ve los datos correctos. Esto simula un escenario real de alta disponibilidad.
 
-**Fragmentación horizontal útil:**
-Las vistas `ventas_capital` y `ventas_occidente` permiten consultar ventas por región sin escanear toda la tabla. En un sistema real con millones de filas, esto reduce significativamente el tiempo de respuesta de reportes por sucursal.
-
-**Réplica local acelera consultas:**
-La tabla `productos_replica` en SQL Server evita cruzar la red hacia PostgreSQL en cada consulta de ventas. Una vez ejecutada la replicación, las consultas Q1, Q2 y Q3 son completamente locales al motor de ventas.
+**Routing automático por sucursal:**
+El campo `sucursal_id` determina el motor destino sin intervención del usuario. Un nuevo vendedor de Capital y uno de Occidente insertan ventas con el mismo formulario; el backend decide dónde va cada una.
 
 **Portabilidad del entorno:**
-Docker Compose levanta los tres motores con un solo comando. Cualquier integrante del equipo (o el catedrático) puede reproducir el entorno exacto en su máquina sin instalar Oracle, PostgreSQL ni SQL Server de forma nativa.
+Docker Compose levanta los tres motores con un solo comando. Cualquier persona puede reproducir el entorno exacto sin instalar Oracle, PostgreSQL ni SQL Server de forma nativa.
 
 ---
 
 ### 11.2 Desventajas y limitaciones
 
 **Sin transacciones ACID cross-motor:**
-Si una venta se registra en SQL Server pero falla la actualización de inventario en PostgreSQL, no hay rollback automático. Resolver esto requiere protocolos como 2PC (Two-Phase Commit), que están fuera del alcance del proyecto.
+Si una venta se registra en SQL Server pero falla la actualización de inventario en PostgreSQL, no hay rollback automático. Esto requeriría 2PC (Two-Phase Commit), fuera del alcance del proyecto.
 
-**Sincronización manual:**
-La replicación es por demanda: hay que ejecutar `replicacion.py` cada vez que cambia el catálogo de productos. En producción se usaría un job programado (cron, Task Scheduler) o replicación nativa del motor.
+**Backup manual (snapshot):**
+El backup hacia Oracle es manual (hay que ejecutar `POST /backup-oracle`). En producción se usaría replicación continua o streaming. El snapshot puede perder las ventas insertadas entre el último backup y el momento del fallo.
 
 **Latencia adicional:**
-Una consulta distribuida abre 2 o 3 conexiones TCP, ejecuta queries en paralelo y ensambla resultados en Python. Aunque funciona bien con ~50 registros, el overhead sería visible con millones de filas sin índices adecuados.
+Una consulta distribuida abre 2 o 3 conexiones TCP y ensambla resultados en Python. Con ~50 registros funciona bien; con millones de filas y sin índices adecuados sería un cuello de botella.
 
-**Orquestación frágil:**
-Si el backend FastAPI cae, toda la integración se pierde. No hay caché ni fallback. En producción se necesitaría un service mesh o al menos healthchecks con reinicio automático.
+**Restauración manual:**
+Al restaurar, el sistema vuelve a SQL Server pero el backup en Oracle contiene las ventas insertadas durante el failover. Sincronizar de vuelta requeriría una migración inversa, que no está implementada en este prototipo.
 
 ---
 
@@ -641,6 +709,9 @@ Si el backend FastAPI cae, toda la integración se pierde. No hay caché ni fall
 | 3 | Oracle rechazaba la columna `cargo` | La columna real en `empleados` se llama `puesto`, no `cargo` | Leer `sql/oracle/02_tablas.sql` antes de escribir las queries del backend |
 | 4 | Oracle tardaba en arrancar | Primera inicialización de XE tarda 1-3 minutos | Esperar el mensaje `DATABASE IS READY TO USE!` en los logs antes de conectar |
 | 5 | SQL Server rechaza conexión sin `TrustServerCertificate` | Docker usa certificado SSL autofirmado | Agregar `TrustServerCertificate=yes` en el connection string de pyodbc |
+| 6 | `ORA-00955` al crear tablas de backup | Las tablas ya existían de una ejecución anterior | Usar `BEGIN EXECUTE IMMEDIATE 'DROP TABLE...'; EXCEPTION WHEN OTHERS THEN NULL; END;` antes de los CREATE |
+| 7 | `ORA-00900` al ejecutar PL/SQL en DBeaver | El delimitador `/` de SQL*Plus no funciona en DBeaver | Agrupar todos los DROP en un único bloque `BEGIN...END;` sin delimitadores; los CREATE van como sentencias independientes |
+| 8 | Ventas de Occidente seguían en SS tras la migración | La migración no las eliminaba | `backend/migracion_ventas.py` lee de SS, inserta en PG con `OVERRIDING SYSTEM VALUE` para preservar IDs, luego elimina de SS |
 
 ---
 
@@ -650,59 +721,85 @@ Si el backend FastAPI cae, toda la integración se pierde. No hay caché ni fall
 
 Las bases de datos distribuidas no son una solución universal. Son la respuesta correcta cuando los datos tienen **propietarios distintos** (una sucursal no debería tener acceso total a los datos de otra), cuando los **volúmenes por dominio** justifican motores especializados, o cuando la **disponibilidad parcial** es preferible a la falla total del sistema.
 
-En este proyecto, la distribución tiene sentido porque:
+En este proyecto, la distribución y el failover tienen sentido porque:
 - El inventario (Occidente) y las ventas (Capital) son operaciones independientes.
 - Los datos administrativos (Oracle/Central) deben estar centralizados y auditados.
-- Ninguna sucursal necesita ver los datos completos de las demás para operar.
+- La caída de un nodo no puede detener la operación de los demás.
 
-### 12.2 Sobre la integración sin linked servers
+### 12.2 Sobre la fragmentación física vs lógica
 
-La decisión de usar Python como capa de orquestación en lugar de Database Links (Oracle) o Linked Servers (SQL Server) fue correcta para este entorno. Las ventajas fueron:
+La diferencia entre una vista (`WHERE sucursal_id = 1`) y una tabla física en otro motor no es trivial:
 
-- **Sin configuración de red compleja:** los tres motores no necesitan verse entre sí, solo el backend Python los ve a todos.
-- **Portabilidad:** el mismo código corre en Windows, Linux y Mac sin cambios.
-- **Control total del JOIN:** se puede aplicar cualquier lógica de negocio antes de devolver el resultado, no solo SQL.
+- **Vista lógica:** los datos siguen en un motor; si ese motor falla, todo falla.
+- **Tabla física en otro motor:** cada nodo es autónomo. Si SQL Server cae, PostgreSQL tiene sus propios datos intactos y Oracle puede absorber el fragmento Capital temporalmente.
 
-La desventaja es que el JOIN ocurre en memoria Python y no puede aprovechar los índices de los motores remotos. Para datasets grandes esto sería un cuello de botella.
+Este proyecto implementa fragmentación **física real**, que es lo que se encontraría en una arquitectura empresarial de mediana escala.
 
-### 12.3 Sobre la fragmentación y replicación
+### 12.3 Sobre el failover y la consistencia eventual
 
-La fragmentación horizontal (vistas por `sucursal_id`) es la forma más simple de fragmentación, pero es suficiente para demostrar el concepto. Lo importante es entender **por qué se fragmenta**: para que cada nodo maneje solo los datos que le corresponden y las consultas locales sean más rápidas.
+El backup snapshot hacia Oracle demuestra un patrón real de alta disponibilidad: un nodo secundario listo para absorber carga si el primario falla. Las limitaciones de esta implementación (backup manual, sin sincronización de vuelta) son exactamente las mismas que tiene cualquier sistema con replicación asíncrona: puede haber pérdida de datos entre el último backup y el momento del fallo.
 
-La replicación snapshot (copiar toda la tabla periódicamente) es la forma más básica de replicación. Funciona bien cuando los datos fuente cambian poco y la consistencia eventual es aceptable. No funciona si se necesita consistencia en tiempo real.
+Resolver esto completamente requeriría replicación continua (WAL streaming en PostgreSQL, Always On en SQL Server) — conceptos que quedan fuera del alcance pedagógico pero que se comprenden mejor después de implementar este prototipo.
 
-### 12.4 Aprendizajes clave
+### 12.4 Sobre la integración sin linked servers
+
+Python como capa de orquestación (en lugar de Database Links u Oracle Linked Servers) ofrece:
+- **Sin configuración de red compleja:** los motores no necesitan verse entre sí.
+- **Portabilidad:** el mismo código corre en Windows, Linux y Mac.
+- **Control total del join y del routing:** cualquier lógica de negocio puede aplicarse antes de devolver el resultado.
+
+La desventaja es que el join ocurre en memoria Python y no aprovecha los índices de los motores remotos. Para datasets grandes sería necesario empujar más lógica al motor.
+
+### 12.5 Aprendizajes clave
 
 1. **Leer el esquema antes de escribir queries.** El error de `cargo` vs `puesto` se habría evitado revisando el DDL antes de asumir nombres de columnas.
-2. **Verificar el entorno antes de codificar.** El driver ODBC disponible en la máquina determina qué string usar. No asumir que está instalada la versión más reciente.
-3. **Docker simplifica la distribución del entorno**, pero no elimina la complejidad de los motores. Cada motor tiene sus propias reglas de autenticación, tipos de datos y dialectos SQL.
-4. **La complejidad real de los sistemas distribuidos** está en la consistencia y el manejo de fallos, no en levantar los contenedores. Este proyecto simula la distribución pero no la hace tolerante a fallos.
+2. **Verificar el entorno antes de codificar.** El driver ODBC disponible determina qué string usar; no asumir que está la versión más reciente.
+3. **Los dialectos SQL difieren en detalles críticos.** `BEGIN...END;` con DBeaver vs SQL*Plus, `OVERRIDING SYSTEM VALUE` en PostgreSQL, `SELECT TOP N` vs `FETCH FIRST N ROWS ONLY` — son diferencias pequeñas con consecuencias grandes.
+4. **Docker simplifica la distribución del entorno**, pero no elimina la complejidad de los motores. Cada motor tiene sus propias reglas de autenticación, tipos de datos y permisos.
+5. **La complejidad real de los sistemas distribuidos** está en la consistencia y el manejo de fallos, no en levantar los contenedores. Este proyecto implementa un failover real (no simulado en código) y eso hace la diferencia para entender por qué los sistemas distribuidos son difíciles de mantener correctos.
 
 ---
 
 ## Anexo A — Cómo regenerar el entorno desde cero
 
 ```powershell
-# Clonar el repositorio
+# 1. Clonar el repositorio
 git clone <url-del-repo>
-cd proyecto-bdd-distribuida
+cd proyecto_final
 
-# Levantar la infraestructura
+# 2. Levantar la infraestructura
 docker compose up -d
 
-# Esperar a que los healthchecks pasen (Oracle tarda ~2 min)
+# 3. Esperar a que los healthchecks pasen (Oracle tarda ~2 min)
 docker compose ps
-
-# Cargar esquemas (los SQL de Oracle y Postgres se ejecutan automáticamente
-# al primer arranque; SQL Server se carga manualmente)
-docker exec -i bdd_sqlserver /opt/mssql-tools18/bin/sqlcmd `
-  -S localhost -U sa -P "SqlServerPass123!" -C `
-  -i /scripts/01_login_db.sql
 ```
 
-## Anexo B — Exportar este documento a PDF
+**Orden de ejecución de scripts SQL en DBeaver:**
 
-**Opción 1 — Extensión de VS Code (más rápido):**
+| Motor | Scripts (en orden) |
+|-------|-------------------|
+| Oracle | `01_setup.sql` → `02_tablas.sql` → `03_seed.sql` → `04_backup.sql` → `05_verificar.sql` |
+| PostgreSQL | `01_setup.sql` → `02_seed.sql` → `03_ventas.sql` → `04_seed_ventas.sql` → `05_verificar.sql` |
+| SQL Server | `01_login_db.sql` → `02_seed.sql` → `03_fragmentacion.sql` → `04_verificar.sql` |
 
-1. Instalar la extensión **Markdown PDF** de yzane.
-2. Abrir `README.md`, clic derecho → *Markdown PDF: Export (pdf)*.
+**Para la demo (dejar solo 5 ventas por motor):**
+
+```
+SQL Server → ejecutar sql/sqlserver/05_reducir_datos.sql
+PostgreSQL → ejecutar sql/postgres/06_reducir_datos.sql
+Oracle     → ejecutar sql/oracle/06_limpiar_backup.sql   (backup ya vacío)
+```
+
+**Levantar el backend y frontend:**
+
+```powershell
+# Backend (en una terminal)
+cd backend
+pip install -r requirements.txt
+uvicorn main:app --reload --port 8000
+
+# Frontend (en otra terminal)
+cd frontend
+pnpm install
+pnpm dev
+```
